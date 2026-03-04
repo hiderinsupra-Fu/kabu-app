@@ -298,7 +298,7 @@
   <!-- Loading -->
   <div id="loadingBox" class="loading-box">
     <div class="spinner"></div>
-    <div class="loading-text">データ取得中...</div>
+    <div class="loading-text" id="loadingText">データ取得中...</div>
   </div>
 
   <!-- Main content -->
@@ -477,30 +477,54 @@ function calcMACD(closes, fast = 12, slow = 26, signal = 9) {
 // ============================================================
 // API
 // ============================================================
+// Yahoo Finance は直接アクセス不可のため複数の CORS プロキシを順番に試す
+// Yahoo Finance は直接アクセス不可のため複数の CORS プロキシを順番に試す
+const PROXIES = [
+  { name: 'corsproxy.io',       make: u => `https://corsproxy.io/?${encodeURIComponent(u)}` },
+  { name: 'allorigins',         make: u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+  { name: 'codetabs',           make: u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+  { name: 'thingproxy',         make: u => `https://thingproxy.freeboard.io/fetch/${u}` },
+];
+
+function setLoadingText(msg) {
+  const el = document.getElementById('loadingText');
+  if (el) el.textContent = msg;
+}
+
+async function tryFetch(url, timeoutMs = 9000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) {
+    clearTimeout(t);
+    return null;
+  }
+}
+
 async function fetchYahoo(symbol, range) {
   const interval = (range === '5y' || range === '2y') ? '1wk' : '1d';
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false`;
+  const target = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false&events=div,splits`;
 
-  // Try direct
-  try {
-    const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    if (r.ok) return await r.json();
-  } catch (_) {}
-
-  // CORS proxy fallback
-  const proxy = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-  const r2 = await fetch(proxy);
-  if (!r2.ok) throw new Error(`HTTP ${r2.status}: データ取得に失敗しました`);
-  return await r2.json();
+  for (const { name, make } of PROXIES) {
+    setLoadingText(`データ取得中... (${name})`);
+    const data = await tryFetch(make(target));
+    if (data?.chart?.result?.[0]) return data;
+  }
+  throw new Error('すべてのプロキシからのデータ取得に失敗しました。しばらく待ってから再試行してください。');
 }
 
 async function fetchQuoteSummary(symbol) {
-  const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=price,summaryDetail`;
-  for (const src of [url, `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`]) {
-    try {
-      const r = await fetch(src);
-      if (r.ok) return await r.json();
-    } catch (_) {}
+  const target = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=price,summaryDetail`;
+  for (const makeUrl of PROXIES) {
+    const data = await tryFetch(makeUrl(target));
+    if (data?.quoteSummary?.result?.[0]) return data;
   }
   return null;
 }
@@ -960,23 +984,18 @@ async function loadData() {
   destroyCharts();
 
   try {
-    const [chartRes, quoteRes] = await Promise.allSettled([
-      fetchYahoo(currentSymbol, currentRange),
-      fetchQuoteSummary(currentSymbol),
-    ]);
+    // chart と quoteSummary を並列取得（quoteSummary は失敗しても続行）
+    const chartData = await fetchYahoo(currentSymbol, currentRange);
+    const quoteData = await fetchQuoteSummary(currentSymbol).catch(() => null);
 
-    if (chartRes.status === 'rejected') throw new Error(chartRes.reason?.message || 'データ取得失敗');
+    if (chartData.chart?.error) throw new Error(chartData.chart.error.description || '銘柄が見つかりません');
 
-    const data = chartRes.value;
-    if (data.chart?.error) throw new Error(data.chart.error.description || '銘柄が見つかりません');
-
-    const result = data.chart?.result?.[0];
+    const result = chartData.chart?.result?.[0];
     if (!result) throw new Error('データが空です。銘柄コードを確認してください (例: AAPL, 7203.T)');
 
-    const quoteData = quoteRes.status === 'fulfilled' ? quoteRes.value : null;
     renderData(result, quoteData);
   } catch (e) {
-    showError(e.message + '  ※ 銘柄コード例: AAPL / 7203.T / ^N225 / BTC-USD');
+    showError(e.message + '\n\n銘柄コード例: AAPL / 7203.T / ^N225 / BTC-USD');
   }
 }
 
